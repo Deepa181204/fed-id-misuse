@@ -1,0 +1,11 @@
+Faker
+pandas
+numpy
+sqlalchemy
+psycopg2-binary
+scikit-learn
+torch
+flwr
+opacus
+sentence-transformers
+tqdm

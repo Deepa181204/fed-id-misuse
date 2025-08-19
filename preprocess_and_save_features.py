@@ -118,7 +118,8 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 import joblib
 
-ROOT = r"C:\Users\MANGIPUDI DEEPA\Desktop\fed-id-misuse"
+ROOT = r"C:\Users\MANGIPUDI DEEPA\OneDrive\Desktop\fed-id-misuse"
+
 DATA_DIR = os.path.join(ROOT, "sample_data")
 OUT_DIR = os.path.join(ROOT, "features")
 os.makedirs(OUT_DIR, exist_ok=True)

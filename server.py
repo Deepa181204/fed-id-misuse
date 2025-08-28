@@ -374,7 +374,7 @@ def load_client_model(client_id):
 # Global lock for aggregation
 agg_lock = threading.Lock()
 
-# ------------------ UTILS ------------------
+# - UTILS -
 def recvall(conn, n):
     data = b""
     while len(data) < n:
@@ -582,7 +582,7 @@ def handle_client(conn, addr):
         conn.close()
         log(f"🔌 Closed {addr}")
 
-# ------------------ MAIN SERVER ------------------
+# - MAIN SERVER -
 def start_server():
     init_db()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

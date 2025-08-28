@@ -106,3 +106,93 @@ Would you like me to now write this as a **1-page crisp project progress report*
 
 
 use sqllite viwer to view the .db file 
+
+
+
+
+Ahh 👍 I see the problem clearly.
+You’re coding on your laptop (with venv + VS Code), then pushing to GitHub / Drive / email, but when you **clone on your office system**, it doesn’t “just run.”
+
+This is very common — it happens because your laptop already has the **Python environment + dependencies + models + features data** set up, while the office system is fresh.
+
+---
+
+### ✅ Steps to make it run anywhere after cloning
+
+#### 1. Python & venv
+
+On the office system:
+
+```bash
+python -m venv venv
+venv\Scripts\activate    # Windows
+source venv/bin/activate # Linux/macOS
+```
+
+#### 2. Install dependencies
+
+Since you already have a `requirements.txt` in your repo, just run:
+
+```bash
+pip install -r requirements.txt
+```
+
+👉 If any library is missing, install manually. For example:
+
+```bash
+pip install torch numpy sqlite3
+```
+
+---
+
+#### 3. Data & Models
+
+Check if these folders exist after clone:
+
+* `features/` (your `*_X_train.npy` and `*_X_test.npy`)
+* `models/` (autoencoder weights and thresholds will be generated)
+
+⚠️ GitHub often ignores big `.npy` or `.pt` files because of **.gitignore** or size limits.
+So, on office PC you might be missing them.
+
+👉 Fix:
+
+* Either **push them with Git LFS** (Git Large File Storage).
+* Or copy-paste them from laptop → Google Drive → download into office repo.
+
+---
+
+#### 4. Database (`server_updates.db`) and CSV logs
+
+These are generated automatically when you run the server, so you don’t need to copy them — unless you want old logs.
+
+---
+
+#### 5. Run
+
+Now you should be able to do:
+
+```bash
+python server.py --host 127.0.0.1 --port 8080
+```
+
+and
+
+```bash
+python client.py --client_id bank --features_dir ./features --server_addr 127.0.0.1:8080 --send_weights
+```
+
+---
+
+### 🔑 Why it fails right now?
+
+Most likely because:
+
+* Missing **virtual environment** and packages.
+* Missing **feature `.npy` files** (GitHub may not have them).
+* Missing **model weights** (also too large for GitHub unless using Git LFS).
+
+---
+
+👉 Suggestion:
+Do you want me to make you a **setup guide (README section)** that you can put in GitHub, so when you clone in office, you can just follow step-by-step to get it working?

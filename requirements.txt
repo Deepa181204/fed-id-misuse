@@ -9,3 +9,7 @@ flwr
 opacus
 sentence-transformers
 tqdm
+flask
+flask-cors
+numpy
+torch

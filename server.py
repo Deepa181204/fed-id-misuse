@@ -289,38 +289,341 @@
 
 
 
-# server.py
-import socket
-import threading
-import torch
-import os
-import pickle
-import sqlite3
-import csv
-import numpy as np
-import json
-from datetime import datetime
+# # server.py
+# import socket
+# import threading
+# import torch
+# import os
+# import pickle
+# import sqlite3
+# import csv
+# import numpy as np
+# import json
+# from datetime import datetime
 
-# ------------------ CONFIG ------------------
+# # ------------------ CONFIG ------------------
+# HOST = "127.0.0.1"
+# PORT = 8080
+# MODEL_DIR = "models"
+# DB_NAME = "server_updates.db"
+# CSV_LOG = "server_updates.csv"
+# GLOBAL_MODEL_PATH = os.path.join(MODEL_DIR, "global_ae.pt")
+# GLOBAL_THRESH_PATH = os.path.join(MODEL_DIR, "global_thresh.npy")
+# GLOBAL_META_PATH = os.path.join(MODEL_DIR, "global_meta.json")
+# MAX_PAYLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+
+# os.makedirs(MODEL_DIR, exist_ok=True)
+
+# # ------------------ LOGGING ------------------
+# def log(msg: str):
+#     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+# # ------------------ DB & CSV ------------------
+# def init_db():
+#     conn = sqlite3.connect(DB_NAME)
+#     cur = conn.cursor()
+#     cur.execute("""
+#         CREATE TABLE IF NOT EXISTS updates (
+#             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#             client_id TEXT NOT NULL,
+#             accuracy REAL,
+#             ts TEXT NOT NULL,
+#             weights BLOB
+#         )
+#     """)
+#     conn.commit()
+#     conn.close()
+#     if not os.path.exists(CSV_LOG):
+#         with open(CSV_LOG, "w", newline="", encoding="utf-8") as f:
+#             w = csv.writer(f)
+#             w.writerow(["id","client_id","accuracy","ts"])
+
+# def log_update(client_id: str, accuracy: float, weights_bytes: bytes | None = None):
+#     ts = datetime.now().isoformat()
+#     conn = sqlite3.connect(DB_NAME)
+#     cur = conn.cursor()
+#     cur.execute(
+#         "INSERT INTO updates (client_id, accuracy, ts, weights) VALUES (?, ?, ?, ?)",
+#         (client_id, accuracy, ts, weights_bytes)
+#     )
+#     conn.commit()
+#     row_id = cur.lastrowid
+#     conn.close()
+#     with open(CSV_LOG, "a", newline="", encoding="utf-8") as f:
+#         w = csv.writer(f)
+#         w.writerow([row_id, client_id, accuracy, ts])
+#     log(f"🗄️  Logged update -> id={row_id}, client='{client_id}', acc={accuracy:.4f}")
+
+# # ------------------ MODEL FILE HELPERS ------------------
+# def save_client_model(client_id, model_state, threshold):
+#     model_path = os.path.join(MODEL_DIR, f"{client_id}_ae.pt")
+#     thresh_path = os.path.join(MODEL_DIR, f"{client_id}_thresh.npy")
+#     torch.save(model_state, model_path)
+#     np.save(thresh_path, np.array([float(threshold) if threshold is not None else 0.0]))
+#     log(f"✅ Saved model for '{client_id}' -> {model_path}, {thresh_path}")
+
+# def load_client_model(client_id):
+#     model_path = os.path.join(MODEL_DIR, f"{client_id}_ae.pt")
+#     thresh_path = os.path.join(MODEL_DIR, f"{client_id}_thresh.npy")
+#     if os.path.exists(model_path) and os.path.exists(thresh_path):
+#         model_state = torch.load(model_path, map_location="cpu")
+#         threshold = np.load(thresh_path)
+#         return model_state, threshold
+#     return None, None
+
+# # Global lock for aggregation
+# agg_lock = threading.Lock()
+
+# # - UTILS -
+# def recvall(conn, n):
+#     data = b""
+#     while len(data) < n:
+#         packet = conn.recv(min(65536, n - len(data)))
+#         if not packet:
+#             return None
+#         data += packet
+#     return data
+
+# def load_global_meta():
+#     if os.path.exists(GLOBAL_META_PATH):
+#         with open(GLOBAL_META_PATH, "r", encoding="utf-8") as f:
+#             return json.load(f)
+#     return {"n_total": 0}
+
+# def save_global_meta(meta):
+#     with open(GLOBAL_META_PATH, "w", encoding="utf-8") as f:
+#         json.dump(meta, f)
+
+# def to_tensor(x):
+#     if isinstance(x, torch.Tensor):
+#         return x.detach().cpu()
+#     if isinstance(x, np.ndarray):
+#         return torch.from_numpy(x)
+#     try:
+#         return torch.tensor(x)
+#     except Exception:
+#         return None
+
+# # ------------------ AGGREGATION ------------------
+# def aggregate_with_client(client_state: dict, n_client: int, client_threshold: float | None):
+#     """
+#     Weighted FedAvg aggregation (element-wise):
+#     new_global = (global*n_total + client*n_client) / (n_total + n_client)
+#     """
+#     with agg_lock:
+#         # Load existing global state and n_total
+#         if not os.path.exists(GLOBAL_MODEL_PATH):
+#             # No global yet -> set global = client
+#             torch.save(client_state, GLOBAL_MODEL_PATH)
+#             if client_threshold is None:
+#                 client_threshold = 0.0
+#             np.save(GLOBAL_THRESH_PATH, np.array([float(client_threshold)]))
+#             meta = {"n_total": int(n_client)}
+#             save_global_meta(meta)
+#             log(f"🔁 Initialized global model from client (n={n_client})")
+#             return client_state, meta["n_total"], float(client_threshold)
+
+#         # Load existing global
+#         global_state = torch.load(GLOBAL_MODEL_PATH, map_location="cpu")
+#         meta = load_global_meta()
+#         n_global = int(meta.get("n_total", 0)) or 0
+#         if n_client <= 0:
+#             n_client = 1
+
+#         # Weighted average
+#         new_state = {}
+#         try:
+#             for k in global_state.keys():
+#                 g = to_tensor(global_state[k]).float()
+#                 c_raw = client_state.get(k)
+#                 if c_raw is None:
+#                     # if client lacks a key, keep global
+#                     new_state[k] = g
+#                     continue
+#                 c = to_tensor(c_raw).float()
+#                 # compute weighted average
+#                 if n_global <= 0:
+#                     merged = c
+#                 else:
+#                     merged = (g * n_global + c * n_client) / (n_global + n_client)
+#                 new_state[k] = merged.clone()
+#         except Exception as e:
+#             log(f"❌ Aggregation error: {e}. Falling back to client state as global.")
+#             new_state = {k: to_tensor(v).float() for k, v in client_state.items()}
+
+#         # new threshold aggregation (weighted)
+#         if os.path.exists(GLOBAL_THRESH_PATH):
+#             old_thresh = float(np.load(GLOBAL_THRESH_PATH)[0])
+#         else:
+#             old_thresh = 0.0
+#         client_thresh = float(client_threshold) if client_threshold is not None else 0.0
+#         new_n = n_global + n_client
+#         if new_n > 0:
+#             new_thresh = (old_thresh * n_global + client_thresh * n_client) / new_n
+#         else:
+#             new_thresh = client_thresh
+
+#         # Save new global
+#         torch.save(new_state, GLOBAL_MODEL_PATH)
+#         np.save(GLOBAL_THRESH_PATH, np.array([float(new_thresh)]))
+#         meta["n_total"] = new_n
+#         save_global_meta(meta)
+
+#         log(f"🔁 Aggregated global model: prev_n={n_global}, added={n_client}, new_n={new_n}")
+#         return new_state, new_n, float(new_thresh)
+
+# # ------------------ CLIENT HANDLER ------------------
+# def handle_client(conn, addr):
+#     try:
+#         log(f"🔌 Connection from {addr}")
+#         conn.settimeout(20.0)
+
+#         # Read 8-byte length header (blocking until exactly 8 bytes)
+#         initial = recvall(conn, 8)
+#         if initial is None:
+#             # fallback: try small text read once
+#             try:
+#                 raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
+#                 message = raw.splitlines()[0].strip() if raw else ""
+#             except Exception:
+#                 message = ""
+#             if not message:
+#                 log(f"⚠ No data from {addr}")
+#                 conn.close()
+#                 return
+#             # text path
+#             log(f"📛 Text message: {message}")
+#             if "," not in message:
+#                 conn.sendall(b"ERR: invalid format")
+#                 return
+#             client_id, accuracy_str = message.split(",", 1)
+#             try:
+#                 accuracy = float(accuracy_str.strip())
+#             except:
+#                 conn.sendall(b"ERR: invalid accuracy")
+#                 return
+#             log_update(client_id, accuracy, None)
+#             # reply legacy ack
+#             _, threshold = load_client_model(client_id)
+#             if threshold is None:
+#                 conn.sendall(f"ACK: logged {client_id} acc={accuracy:.4f}; no model".encode('utf-8'))
+#             else:
+#                 conn.sendall(f"ACK: logged {client_id} acc={accuracy:.4f}; server-thresh={float(threshold[0]):.6f}".encode('utf-8'))
+#             return
+
+#         # parse header size
+#         msg_size = int.from_bytes(initial, 'big')
+#         if msg_size <= 0 or msg_size > MAX_PAYLOAD_SIZE:
+#             log(f"⚠ Invalid payload size {msg_size} from {addr}, rejecting")
+#             conn.sendall(b"ERR: invalid size")
+#             return
+
+#         # read payload
+#         payload = recvall(conn, msg_size)
+#         if payload is None or len(payload) != msg_size:
+#             log(f"⚠ Incomplete payload from {addr}")
+#             conn.sendall(b"ERR: incomplete payload")
+#             return
+
+#         # try to unpickle
+#         try:
+#             obj = pickle.loads(payload)
+#         except Exception as e:
+#             log(f"⚠ Unpickle failed: {e}")
+#             conn.sendall(b"ERR: invalid payload")
+#             return
+
+#         # Expect dict with keys
+#         if not isinstance(obj, dict) or 'client_id' not in obj:
+#             log("⚠ Payload missing 'client_id' → invalid")
+#             conn.sendall(b"ERR: invalid structure")
+#             return
+
+#         client_id = str(obj.get('client_id'))
+#         accuracy = float(obj.get('accuracy', 0.0))
+#         client_state = obj.get('state_dict', None)
+#         threshold = obj.get('threshold', None)
+#         n_samples = int(obj.get('n_samples', 1) or 1)
+
+#         # Log raw update in DB
+#         log_update(client_id, accuracy, weights_bytes=payload)
+
+#         # Save client model file
+#         if client_state is not None:
+#             try:
+#                 save_client_model(client_id, client_state, threshold)
+#             except Exception as e:
+#                 log(f"⚠ Could not save client model: {e}")
+
+#         # Aggregate into global model (asynchronous FedAvg)
+#         global_state, new_n_total, new_thresh = aggregate_with_client(client_state or {}, n_samples, threshold)
+
+#         # Prepare response payload (global model)
+#         resp_obj = {
+#             "global_state_dict": global_state,
+#             "n_total": new_n_total,
+#             "global_threshold": new_thresh
+#         }
+#         resp_bytes = pickle.dumps(resp_obj)
+#         resp_size = len(resp_bytes)
+#         # send length-prefixed response
+#         conn.sendall(resp_size.to_bytes(8, 'big') + resp_bytes)
+#         log(f"⬆ Sent aggregated global model back to {client_id} (size {resp_size} bytes)")
+        
+
+#     except Exception as e:
+#         log(f"❌ Error handling client {addr}: {e}")
+
+#     finally:
+#         try:
+#             conn.shutdown(socket.SHUT_RDWR)
+#         except Exception:
+#             pass
+#         conn.close()
+#         log(f"🔌 Closed {addr}")
+
+# # - MAIN SERVER -
+# def start_server():
+#     init_db()
+#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+#         s.bind((HOST, PORT))
+#         s.listen(8)
+#         log(f"🚀 Server running on {HOST}:{PORT}")
+#         while True:
+#             conn, addr = s.accept()
+#             t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+#             t.start()
+
+# if __name__ == "__main__":
+#     start_server()
+
+
+
+# server.py
+import socket, threading, pickle, sqlite3, csv, os, json, numpy as np, torch
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path(__file__).parent.resolve()
 HOST = "127.0.0.1"
 PORT = 8080
-MODEL_DIR = "models"
-DB_NAME = "server_updates.db"
-CSV_LOG = "server_updates.csv"
-GLOBAL_MODEL_PATH = os.path.join(MODEL_DIR, "global_ae.pt")
-GLOBAL_THRESH_PATH = os.path.join(MODEL_DIR, "global_thresh.npy")
-GLOBAL_META_PATH = os.path.join(MODEL_DIR, "global_meta.json")
-MAX_PAYLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+MODEL_DIR = BASE / "models"
+DB_PATH = BASE / "server_updates.db"
+CSV_LOG = BASE / "server_updates.csv"
+GLOBAL_MODEL_PATH = MODEL_DIR / "global_ae.pt"
+GLOBAL_THRESH_PATH = MODEL_DIR / "global_thresh.npy"
+GLOBAL_META_PATH = MODEL_DIR / "global_meta.json"
+MAX_PAYLOAD_SIZE = 200 * 1024 * 1024  # 200 MB
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ------------------ LOGGING ------------------
 def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# ------------------ DB & CSV ------------------
+# ---------- DB / CSV ----------
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS updates (
@@ -333,14 +636,14 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    if not os.path.exists(CSV_LOG):
+    if not CSV_LOG.exists():
         with open(CSV_LOG, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["id","client_id","accuracy","ts"])
 
 def log_update(client_id: str, accuracy: float, weights_bytes: bytes | None = None):
     ts = datetime.now().isoformat()
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO updates (client_id, accuracy, ts, weights) VALUES (?, ?, ?, ?)",
@@ -354,27 +657,35 @@ def log_update(client_id: str, accuracy: float, weights_bytes: bytes | None = No
         w.writerow([row_id, client_id, accuracy, ts])
     log(f"🗄️  Logged update -> id={row_id}, client='{client_id}', acc={accuracy:.4f}")
 
-# ------------------ MODEL FILE HELPERS ------------------
+# ---------- model file helpers ----------
 def save_client_model(client_id, model_state, threshold):
-    model_path = os.path.join(MODEL_DIR, f"{client_id}_ae.pt")
-    thresh_path = os.path.join(MODEL_DIR, f"{client_id}_thresh.npy")
-    torch.save(model_state, model_path)
-    np.save(thresh_path, np.array([float(threshold) if threshold is not None else 0.0]))
-    log(f"✅ Saved model for '{client_id}' -> {model_path}, {thresh_path}")
+    model_path = MODEL_DIR / f"{client_id}_ae.pt"
+    thresh_path = MODEL_DIR / f"{client_id}_thresh.npy"
+    torch.save(model_state, str(model_path))
+    np.save(str(thresh_path), np.array([float(threshold) if threshold is not None else 0.0]))
+    log(f"✅ Saved model for '{client_id}' -> {model_path.name}, {thresh_path.name}")
 
 def load_client_model(client_id):
-    model_path = os.path.join(MODEL_DIR, f"{client_id}_ae.pt")
-    thresh_path = os.path.join(MODEL_DIR, f"{client_id}_thresh.npy")
-    if os.path.exists(model_path) and os.path.exists(thresh_path):
-        model_state = torch.load(model_path, map_location="cpu")
-        threshold = np.load(thresh_path)
+    model_path = MODEL_DIR / f"{client_id}_ae.pt"
+    thresh_path = MODEL_DIR / f"{client_id}_thresh.npy"
+    if model_path.exists() and thresh_path.exists():
+        model_state = torch.load(str(model_path), map_location="cpu")
+        threshold = np.load(str(thresh_path))
         return model_state, threshold
     return None, None
 
-# Global lock for aggregation
-agg_lock = threading.Lock()
+# ---------- global meta ----------
+def load_global_meta():
+    if GLOBAL_META_PATH.exists():
+        with open(GLOBAL_META_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"n_total": 0}
 
-# - UTILS -
+def save_global_meta(meta):
+    with open(GLOBAL_META_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+# ---------- utils ----------
 def recvall(conn, n):
     data = b""
     while len(data) < n:
@@ -383,16 +694,6 @@ def recvall(conn, n):
             return None
         data += packet
     return data
-
-def load_global_meta():
-    if os.path.exists(GLOBAL_META_PATH):
-        with open(GLOBAL_META_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"n_total": 0}
-
-def save_global_meta(meta):
-    with open(GLOBAL_META_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
 
 def to_tensor(x):
     if isinstance(x, torch.Tensor):
@@ -404,44 +705,35 @@ def to_tensor(x):
     except Exception:
         return None
 
-# ------------------ AGGREGATION ------------------
+agg_lock = threading.Lock()
+
+# ---------- aggregation (weighted FedAvg) ----------
 def aggregate_with_client(client_state: dict, n_client: int, client_threshold: float | None):
-    """
-    Weighted FedAvg aggregation (element-wise):
-    new_global = (global*n_total + client*n_client) / (n_total + n_client)
-    """
     with agg_lock:
-        # Load existing global state and n_total
-        if not os.path.exists(GLOBAL_MODEL_PATH):
-            # No global yet -> set global = client
-            torch.save(client_state, GLOBAL_MODEL_PATH)
-            if client_threshold is None:
-                client_threshold = 0.0
-            np.save(GLOBAL_THRESH_PATH, np.array([float(client_threshold)]))
+        if not GLOBAL_MODEL_PATH.exists():
+            # first global
+            torch.save(client_state, str(GLOBAL_MODEL_PATH))
+            np.save(str(GLOBAL_THRESH_PATH), np.array([float(client_threshold) if client_threshold is not None else 0.0]))
             meta = {"n_total": int(n_client)}
             save_global_meta(meta)
             log(f"🔁 Initialized global model from client (n={n_client})")
-            return client_state, meta["n_total"], float(client_threshold)
+            return client_state, meta["n_total"], float(client_threshold or 0.0)
 
-        # Load existing global
-        global_state = torch.load(GLOBAL_MODEL_PATH, map_location="cpu")
+        global_state = torch.load(str(GLOBAL_MODEL_PATH), map_location="cpu")
         meta = load_global_meta()
         n_global = int(meta.get("n_total", 0)) or 0
         if n_client <= 0:
             n_client = 1
 
-        # Weighted average
         new_state = {}
         try:
             for k in global_state.keys():
                 g = to_tensor(global_state[k]).float()
                 c_raw = client_state.get(k)
                 if c_raw is None:
-                    # if client lacks a key, keep global
                     new_state[k] = g
                     continue
                 c = to_tensor(c_raw).float()
-                # compute weighted average
                 if n_global <= 0:
                     merged = c
                 else:
@@ -451,37 +743,29 @@ def aggregate_with_client(client_state: dict, n_client: int, client_threshold: f
             log(f"❌ Aggregation error: {e}. Falling back to client state as global.")
             new_state = {k: to_tensor(v).float() for k, v in client_state.items()}
 
-        # new threshold aggregation (weighted)
-        if os.path.exists(GLOBAL_THRESH_PATH):
-            old_thresh = float(np.load(GLOBAL_THRESH_PATH)[0])
-        else:
-            old_thresh = 0.0
+        # thresholds (weighted)
+        old_thresh = float(np.load(str(GLOBAL_THRESH_PATH))[0]) if GLOBAL_THRESH_PATH.exists() else 0.0
         client_thresh = float(client_threshold) if client_threshold is not None else 0.0
         new_n = n_global + n_client
-        if new_n > 0:
-            new_thresh = (old_thresh * n_global + client_thresh * n_client) / new_n
-        else:
-            new_thresh = client_thresh
+        new_thresh = (old_thresh * n_global + client_thresh * n_client) / new_n if new_n > 0 else client_thresh
 
-        # Save new global
-        torch.save(new_state, GLOBAL_MODEL_PATH)
-        np.save(GLOBAL_THRESH_PATH, np.array([float(new_thresh)]))
+        torch.save(new_state, str(GLOBAL_MODEL_PATH))
+        np.save(str(GLOBAL_THRESH_PATH), np.array([float(new_thresh)]))
         meta["n_total"] = new_n
         save_global_meta(meta)
 
         log(f"🔁 Aggregated global model: prev_n={n_global}, added={n_client}, new_n={new_n}")
         return new_state, new_n, float(new_thresh)
 
-# ------------------ CLIENT HANDLER ------------------
+# ---------- client handler ----------
 def handle_client(conn, addr):
     try:
         log(f"🔌 Connection from {addr}")
         conn.settimeout(20.0)
 
-        # Read 8-byte length header (blocking until exactly 8 bytes)
         initial = recvall(conn, 8)
         if initial is None:
-            # fallback: try small text read once
+            # fallback to simple text mode
             try:
                 raw = conn.recv(4096).decode('utf-8', errors='replace').strip()
                 message = raw.splitlines()[0].strip() if raw else ""
@@ -491,7 +775,7 @@ def handle_client(conn, addr):
                 log(f"⚠ No data from {addr}")
                 conn.close()
                 return
-            # text path
+
             log(f"📛 Text message: {message}")
             if "," not in message:
                 conn.sendall(b"ERR: invalid format")
@@ -503,7 +787,6 @@ def handle_client(conn, addr):
                 conn.sendall(b"ERR: invalid accuracy")
                 return
             log_update(client_id, accuracy, None)
-            # reply legacy ack
             _, threshold = load_client_model(client_id)
             if threshold is None:
                 conn.sendall(f"ACK: logged {client_id} acc={accuracy:.4f}; no model".encode('utf-8'))
@@ -511,21 +794,18 @@ def handle_client(conn, addr):
                 conn.sendall(f"ACK: logged {client_id} acc={accuracy:.4f}; server-thresh={float(threshold[0]):.6f}".encode('utf-8'))
             return
 
-        # parse header size
         msg_size = int.from_bytes(initial, 'big')
         if msg_size <= 0 or msg_size > MAX_PAYLOAD_SIZE:
-            log(f"⚠ Invalid payload size {msg_size} from {addr}, rejecting")
+            log(f"⚠ Invalid payload size {msg_size} from {addr}")
             conn.sendall(b"ERR: invalid size")
             return
 
-        # read payload
         payload = recvall(conn, msg_size)
         if payload is None or len(payload) != msg_size:
             log(f"⚠ Incomplete payload from {addr}")
             conn.sendall(b"ERR: incomplete payload")
             return
 
-        # try to unpickle
         try:
             obj = pickle.loads(payload)
         except Exception as e:
@@ -533,9 +813,8 @@ def handle_client(conn, addr):
             conn.sendall(b"ERR: invalid payload")
             return
 
-        # Expect dict with keys
         if not isinstance(obj, dict) or 'client_id' not in obj:
-            log("⚠ Payload missing 'client_id' → invalid")
+            log("⚠ Payload missing 'client_id' -> invalid")
             conn.sendall(b"ERR: invalid structure")
             return
 
@@ -545,31 +824,25 @@ def handle_client(conn, addr):
         threshold = obj.get('threshold', None)
         n_samples = int(obj.get('n_samples', 1) or 1)
 
-        # Log raw update in DB
-        log_update(client_id, accuracy, weights_bytes=payload)
+        # Log update (payload stored as BLOB)
+        log_update(client_id, accuracy, payload)
 
-        # Save client model file
+        # Save client model file (if present)
         if client_state is not None:
             try:
                 save_client_model(client_id, client_state, threshold)
             except Exception as e:
                 log(f"⚠ Could not save client model: {e}")
 
-        # Aggregate into global model (asynchronous FedAvg)
+        # Aggregate
         global_state, new_n_total, new_thresh = aggregate_with_client(client_state or {}, n_samples, threshold)
 
-        # Prepare response payload (global model)
-        resp_obj = {
-            "global_state_dict": global_state,
-            "n_total": new_n_total,
-            "global_threshold": new_thresh
-        }
-        resp_bytes = pickle.dumps(resp_obj)
+        # Reply (length-prefixed pickled dict)
+        resp_obj = {"global_state_dict": global_state, "n_total": new_n_total, "global_threshold": new_thresh}
+        resp_bytes = pickle.dumps(resp_obj, protocol=pickle.HIGHEST_PROTOCOL)
         resp_size = len(resp_bytes)
-        # send length-prefixed response
         conn.sendall(resp_size.to_bytes(8, 'big') + resp_bytes)
         log(f"⬆ Sent aggregated global model back to {client_id} (size {resp_size} bytes)")
-        
 
     except Exception as e:
         log(f"❌ Error handling client {addr}: {e}")
@@ -582,7 +855,7 @@ def handle_client(conn, addr):
         conn.close()
         log(f"🔌 Closed {addr}")
 
-# - MAIN SERVER -
+# ---------- main ----------
 def start_server():
     init_db()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

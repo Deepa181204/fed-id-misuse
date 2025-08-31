@@ -425,16 +425,165 @@
 
 
 
-# client.py
-import argparse
-import socket
-import torch
-import torch.nn as nn
-import numpy as np
-import os
-import pickle
+# # client.py
+# import argparse
+# import socket
+# import torch
+# import torch.nn as nn
+# import numpy as np
+# import os
+# import pickle
 
-# ---- Autoencoder (must match train_local_ae.py) ----
+# # ---- Autoencoder (must match train_local_ae.py) ----
+# class AE(nn.Module):
+#     def __init__(self, dim):
+#         super().__init__()
+#         self.encoder = nn.Sequential(
+#             nn.Linear(dim, 32), nn.ReLU(),
+#             nn.Linear(32, 8), nn.ReLU(),
+#             nn.Linear(8, 4)
+#         )
+#         self.decoder = nn.Sequential(
+#             nn.Linear(4, 8), nn.ReLU(),
+#             nn.Linear(8, 32), nn.ReLU(),
+#             nn.Linear(32, dim)
+#         )
+#     def forward(self, x):
+#         z = self.encoder(x)
+#         return self.decoder(z)
+
+# def recvall(conn, n):
+#     data = b""
+#     while len(data) < n:
+#         packet = conn.recv(min(65536, n - len(data)))
+#         if not packet:
+#             return None
+#         data += packet
+#     return data
+
+# def send_length_prefixed(sock, data_bytes: bytes):
+#     sock.sendall(len(data_bytes).to_bytes(8, 'big'))
+#     sock.sendall(data_bytes)
+
+# def receive_length_prefixed(sock):
+#     header = recvall(sock, 8)
+#     if not header:
+#         return None
+#     size = int.from_bytes(header, 'big')
+#     if size <= 0:
+#         return None
+#     payload = recvall(sock, size)
+#     return payload
+
+# # ---- Client script ----
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--client_id", required=True)
+#     parser.add_argument("--features_dir", required=True)
+#     parser.add_argument("--server_addr", required=True, help="host:port")
+#     parser.add_argument("--send_weights", action="store_true", help="send model weights and wait for global model back")
+#     args = parser.parse_args()
+
+#     host, port_s = args.server_addr.split(":")
+#     port = int(port_s)
+
+#     x_train_path = os.path.join(args.features_dir, f"{args.client_id}_X_train.npy")
+#     x_test_path = os.path.join(args.features_dir, f"{args.client_id}_X_test.npy")
+#     if not os.path.exists(x_train_path) or not os.path.exists(x_test_path):
+#         raise FileNotFoundError("Missing feature files; run preprocess first")
+
+#     X_train = np.load(x_train_path)
+#     X_test = np.load(x_test_path)
+#     n_train = X_train.shape[0]
+#     input_dim = X_train.shape[1]
+
+#     model_path = os.path.join("models", f"{args.client_id}_ae.pt")
+#     thresh_path = os.path.join("models", f"{args.client_id}_thresh.npy")
+#     if not os.path.exists(model_path) or not os.path.exists(thresh_path):
+#         raise FileNotFoundError("Missing trained model/threshold for client")
+
+#     model = AE(input_dim)
+#     model.load_state_dict(torch.load(model_path, map_location="cpu"))
+#     model.eval()
+
+#     threshold = float(np.load(thresh_path)[0])
+
+#     # Evaluate on test
+#     X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+#     with torch.no_grad():
+#         recon = model(X_test_tensor)
+#         mse = torch.mean((recon - X_test_tensor) ** 2, dim=1).numpy()
+#     y_pred = (mse > threshold).astype(int)
+#     accuracy = float((y_pred == 0).mean())
+
+#     print(f"[{args.client_id}] Accuracy: {accuracy:.4f} (thresh={threshold:.6f})")
+
+#     # Connect and send
+#     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+#         s.connect((host, port))
+
+#         if args.send_weights:
+#             # build payload: include n_samples so server can do weighted avg
+#             # ensure state_dict values are CPU tensors (they usually are)
+#             state_dict = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model.state_dict().items()}
+#             payload = {
+#                 "client_id": args.client_id,
+#                 "accuracy": accuracy,
+#                 "state_dict": state_dict,
+#                 "threshold": float(threshold),
+#                 "n_samples": int(n_train)
+#             }
+#             data_bytes = pickle.dumps(payload)
+#             print(f"[{args.client_id}] Sending binary update ({len(data_bytes)/1024:.1f} KB)...")
+#             send_length_prefixed(s, data_bytes)
+
+#             # Wait for length-prefixed response (global model)
+#             resp = receive_length_prefixed(s)
+#             if resp is None:
+#                 print("[client] No response or invalid response from server")
+#             else:
+#                 try:
+#                     resp_obj = pickle.loads(resp)
+#                 except Exception as e:
+#                     print(f"[client] Could not unpickle server response: {e}")
+#                 else:
+#                     gstate = resp_obj.get("global_state_dict")
+#                     g_n = resp_obj.get("n_total")
+#                     g_thresh = resp_obj.get("global_threshold", None)
+#                     if gstate:
+#                         # Convert values to tensors if needed
+#                         safe_state = {}
+#                         for k, v in gstate.items():
+#                             if isinstance(v, torch.Tensor):
+#                                 safe_state[k] = v
+#                             else:
+#                                 try:
+#                                     safe_state[k] = torch.tensor(v)
+#                                 except:
+#                                     safe_state[k] = torch.tensor(np.array(v))
+#                         # overwrite local model
+#                         model.load_state_dict(safe_state)
+#                         torch.save(model.state_dict(), model_path)
+#                         if g_thresh is not None:
+#                             np.save(thresh_path, np.array([float(g_thresh)]))
+#                         print(f"[{args.client_id}] Received global model (n_total={g_n}). Local model updated and saved.")
+#                     else:
+#                         print("[client] Server response did not contain global model.")
+#         else:
+#             # fallback: send simple csv text (legacy)
+#             message = f"{args.client_id},{accuracy}"
+#             s.sendall(message.encode('utf-8'))
+#             resp = s.recv(4096)
+#             print("[client] Server response:", resp.decode('utf-8', errors='replace'))
+
+#     print(f"[{args.client_id}] Done.")
+
+
+
+
+# client.py
+import argparse, socket, pickle, os, numpy as np, torch, torch.nn as nn
+
 class AE(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -462,26 +611,22 @@ def recvall(conn, n):
     return data
 
 def send_length_prefixed(sock, data_bytes: bytes):
-    sock.sendall(len(data_bytes).to_bytes(8, 'big'))
-    sock.sendall(data_bytes)
+    sock.sendall(len(data_bytes).to_bytes(8, 'big') + data_bytes)
 
 def receive_length_prefixed(sock):
     header = recvall(sock, 8)
     if not header:
         return None
     size = int.from_bytes(header, 'big')
-    if size <= 0:
-        return None
     payload = recvall(sock, size)
     return payload
 
-# ---- Client script ----
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--client_id", required=True)
     parser.add_argument("--features_dir", required=True)
     parser.add_argument("--server_addr", required=True, help="host:port")
-    parser.add_argument("--send_weights", action="store_true", help="send model weights and wait for global model back")
+    parser.add_argument("--send_weights", action="store_true")
     args = parser.parse_args()
 
     host, port_s = args.server_addr.split(":")
@@ -494,8 +639,8 @@ if __name__ == "__main__":
 
     X_train = np.load(x_train_path)
     X_test = np.load(x_test_path)
-    n_train = X_train.shape[0]
-    input_dim = X_train.shape[1]
+    n_train = int(X_train.shape[0])
+    input_dim = int(X_train.shape[1])
 
     model_path = os.path.join("models", f"{args.client_id}_ae.pt")
     thresh_path = os.path.join("models", f"{args.client_id}_thresh.npy")
@@ -508,7 +653,6 @@ if __name__ == "__main__":
 
     threshold = float(np.load(thresh_path)[0])
 
-    # Evaluate on test
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
     with torch.no_grad():
         recon = model(X_test_tensor)
@@ -518,13 +662,11 @@ if __name__ == "__main__":
 
     print(f"[{args.client_id}] Accuracy: {accuracy:.4f} (thresh={threshold:.6f})")
 
-    # Connect and send
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((host, port))
 
         if args.send_weights:
-            # build payload: include n_samples so server can do weighted avg
-            # ensure state_dict values are CPU tensors (they usually are)
+            # pack state_dict (cpu tensors)
             state_dict = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model.state_dict().items()}
             payload = {
                 "client_id": args.client_id,
@@ -533,11 +675,11 @@ if __name__ == "__main__":
                 "threshold": float(threshold),
                 "n_samples": int(n_train)
             }
-            data_bytes = pickle.dumps(payload)
+            data_bytes = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
             print(f"[{args.client_id}] Sending binary update ({len(data_bytes)/1024:.1f} KB)...")
             send_length_prefixed(s, data_bytes)
 
-            # Wait for length-prefixed response (global model)
+            # receive reply
             resp = receive_length_prefixed(s)
             if resp is None:
                 print("[client] No response or invalid response from server")
@@ -551,7 +693,7 @@ if __name__ == "__main__":
                     g_n = resp_obj.get("n_total")
                     g_thresh = resp_obj.get("global_threshold", None)
                     if gstate:
-                        # Convert values to tensors if needed
+                        # ensure convert to tensors if necessary
                         safe_state = {}
                         for k, v in gstate.items():
                             if isinstance(v, torch.Tensor):
@@ -561,7 +703,6 @@ if __name__ == "__main__":
                                     safe_state[k] = torch.tensor(v)
                                 except:
                                     safe_state[k] = torch.tensor(np.array(v))
-                        # overwrite local model
                         model.load_state_dict(safe_state)
                         torch.save(model.state_dict(), model_path)
                         if g_thresh is not None:
@@ -570,7 +711,7 @@ if __name__ == "__main__":
                     else:
                         print("[client] Server response did not contain global model.")
         else:
-            # fallback: send simple csv text (legacy)
+            # legacy: send "client,accuracy" text
             message = f"{args.client_id},{accuracy}"
             s.sendall(message.encode('utf-8'))
             resp = s.recv(4096)
